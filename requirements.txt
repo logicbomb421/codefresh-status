@@ -1,0 +1,6 @@
+rumps
+requests
+python-dateutil
+inflect
+tinydb
+py2app

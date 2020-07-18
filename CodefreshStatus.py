@@ -1,22 +1,51 @@
-# TODO: logging somehow
 # TODO: actually handle errors...
 
-import rumps, requests, enum, webbrowser, datetime, dateutil, dateutil.parser, inflect, tinydb
+import rumps, requests, enum, webbrowser, datetime, dateutil, dateutil.parser, inflect, tinydb, os, logging
 
 rumps.debug_mode(True)
 
-cf_build_template = "https://g.codefresh.io/build/%(id)s"
-cf_root = "https://g.codefresh.io/api/workflow"
-# TODO: relative path resolution
-red_icon = "/Users/mhill/Projects/Personal/cfstatus/red.png"
-green_icon = "/Users/mhill/Projects/Personal/cfstatus/green.png"
-db_path = "/Users/mhill/Projects/Personal/cfstatus/db.json"
+red_icon = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets/red.png"))
+green_icon = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets/green.png"))
+db_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "db.json"))
 
 p = inflect.engine()
-db = tinydb.TinyDB(db_path)
+db = tinydb.TinyDB(db_file)
 
 ignore_build_ids = db.table("ignore_build_ids")
-settings = db.table("settings")
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s [%(levelname)s]: %(message)s")
+log = logging.getLogger("cfstatus")
+
+
+class Settings(tinydb.table.Table):
+    @property
+    def codefresh_api_key(self) -> str:
+        return self.find_by_key("codefresh_api_key")
+
+    @property
+    def github_username(self) -> str:
+        return self.find_by_key("github_username")
+
+    @property
+    def status_check_interval(self) -> str:
+        return self.find_by_key("status_check_interval")
+
+    def __init__(self):
+        super().__init__(db.storage, "settings")
+
+    def find_by_key(self, key: str):
+        all_settings = self.all()
+        return next(iter([s for s in all_settings if s.get(key)]), {}).get(key, None)
+
+    def set_default_value(self, key, value, overwrite=False):
+        exists = self.find_by_key(key)
+        if exists and not overwrite:
+            return
+        mapping = {key: value}
+        self.update(mapping) if exists else self.insert(mapping)
+
+
+settings = Settings()
 
 
 class CallableEnum(enum.Enum):
@@ -28,6 +57,18 @@ class TimePeriods(CallableEnum):
     today = "Today"
     this_week = "This Week"
     this_month = "This Month"
+
+
+class SettingsChoices(CallableEnum):
+    codefresh_api_key = "Codefresh API Key"
+    github_username = "Github Username"
+    status_check_interval = "Status Check Interval"
+
+
+class ErroredBuildsMenuChoices(CallableEnum):
+    view = "View"
+    restart = "Restart"
+    mark_fixed = "Mark Fixed"
 
 
 class MenuState(CallableEnum):
@@ -81,17 +122,21 @@ class ErroredBuildsMenuItem(rumps.MenuItem):
         super().__init__(name)
         self.build = build
         self.app = app
-        self["View"] = rumps.MenuItem("View", callback=self._view_build)
+        self[ErroredBuildsMenuChoices.view()] = rumps.MenuItem(
+            ErroredBuildsMenuChoices.view(), callback=self._view_build
+        )
         # TODO:(idea): if we restart a build, it would be cool to check if it succeeded
         # when we look for builds, and if so, auto-mark it fixed.
-        self["Restart"] = rumps.MenuItem("Restart")  # TODO: handler
-        self["Mark Fixed"] = rumps.MenuItem("Mark Fixed", callback=self._mark_fixed)
+        self[ErroredBuildsMenuChoices.restart()] = rumps.MenuItem(ErroredBuildsMenuChoices.restart())  # TODO: handler
+        self[ErroredBuildsMenuChoices.mark_fixed()] = rumps.MenuItem(
+            ErroredBuildsMenuChoices.mark_fixed(), callback=self._mark_fixed
+        )
 
     def _view_build(self, sender):
-        webbrowser.open(cf_build_template % self.build)
+        webbrowser.open("https://g.codefresh.io/build/%(id)s" % self.build)
 
     def _mark_fixed(self, sender):
-        print("ignoring build with id " + self.build["id"])
+        log.info("ignoring build with id " + self.build["id"])
         ignore_build_ids.insert({"build_id": self.build["id"]})
         del self.app.menu[Menus.errored_builds()][self.build["id"]]
         self.app.last_errored_builds.remove(self.build)
@@ -99,35 +144,43 @@ class ErroredBuildsMenuItem(rumps.MenuItem):
 
 
 class SettingsMenu(rumps.MenuItem):
-    def __init__(self):
+    def __init__(self, app):
         super().__init__(Menus.settings())
-        # TODO: the weird 'next(iter(...))' logic is copypasted from _update_errored_builds_menu.. need to clean this up
-        self["Codefresh API Key"] = rumps.MenuItem(
-            "Codefresh API Key",
-            callback=self._gather_user_input(
-                "Codefresh API Key", "The Codefresh API key to authenticate with.", "codefresh_api_key",
-            ),
+        self.app = app
+        self[SettingsChoices.codefresh_api_key()] = rumps.MenuItem(
+            SettingsChoices.codefresh_api_key(),
+            callback=self._gather_user_input("The Codefresh API key to authenticate with.", "codefresh_api_key",),
         )
-        self["Github Username"] = rumps.MenuItem(
-            "Github Username",
-            callback=self._gather_user_input(
-                "Github Username", "The Github username used to filter builds.", "github_username",
-            ),
+        self[SettingsChoices.github_username()] = rumps.MenuItem(
+            SettingsChoices.github_username(),
+            callback=self._gather_user_input("The Github username used to filter builds.", "github_username",),
         )
 
-    def _gather_user_input(self, title, message, db_key):
+        def _set_interval(interval):
+            self.app.event_loop.interval = float(interval)
+
+        self[SettingsChoices.status_check_interval()] = rumps.MenuItem(
+            SettingsChoices.status_check_interval(),
+            callback=self._gather_user_input(
+                "The number of seconds between checking Codefresh builds.", "status_check_interval", _set_interval,
+            ),
+        )
+        self._set_defaults()
+
+    def _set_defaults(self):
+        settings.set_default_value("status_check_interval", 10)
+
+    def _gather_user_input(self, message, db_key, on_update=None):
         def _gather(sender):
-            all_settings = settings.all()
             response = rumps.Window(
-                title=title,
-                message=message,
-                default_text=next(iter([s for s in all_settings if s.get(db_key)]), {}).get(db_key, ""),
-                cancel=True,
+                title=sender.title, message=message, default_text=settings.find_by_key(db_key) or "", cancel=True,
             ).run()
-            print(response)
-            if response.clicked:
-                print(f"updating settings[{db_key}] with {response.text}")
-                settings.update({db_key: response.text})
+            if not response.clicked:
+                return
+            log.info(f"updating settings[{db_key}] with {response.text}")
+            settings.update({db_key: response.text})
+            if on_update:
+                on_update(response.text)
 
         return _gather
 
@@ -139,29 +192,30 @@ class CodefreshStatusApp(rumps.App):
         super().__init__(
             "Codefresh Status",
             icon=green_icon,
-            menu=[ErroredBuildsMenu(), rumps.separator, TimePeriodMenu(self), SettingsMenu(), rumps.separator],
+            menu=[
+                rumps.separator,
+                ErroredBuildsMenu(),
+                rumps.separator,
+                TimePeriodMenu(self),
+                SettingsMenu(self),
+                rumps.separator,
+            ],
         )
+        self.event_loop = rumps.Timer(self._get_cf_builds, float(settings.status_check_interval))
+        self.event_loop.start()
 
     # TODO: this runs in a separate thread, might need to add thread safety logic
-    @rumps.timer(10)  # TODO: setting
     def _get_cf_builds(self, sender):
-        all_settings = settings.all()
-        codefresh_api_key = next(iter([s for s in all_settings if s.get("codefresh_api_key")]), {}).get(
-            "codefresh_api_key", None
-        )
-        github_username = next(iter([s for s in all_settings if s.get("github_username")]), {}).get(
-            "github_username", None
-        )
-        if not codefresh_api_key or not github_username:
-            print("missing required setting(s): codefresh_api_key, github_username")
+        if not settings.codefresh_api_key or not settings.github_username:
+            log.error("missing required setting(s): codefresh_api_key, github_username")
             self.icon = red_icon
             self.title = "!! Missing Required Settings !!"
             return
         self.title = None
-        print("getting cf builds")
+        log.info("getting cf builds")
         response = requests.get(
-            cf_root,
-            headers={"Authorization": codefresh_api_key},
+            "https://g.codefresh.io/api/workflow",
+            headers={"Authorization": settings.codefresh_api_key},
             params={
                 "inlineView[filters][0][selectedValue]": "type",
                 "inlineView[filters][0][findType]": "is",
@@ -169,33 +223,39 @@ class CodefreshStatusApp(rumps.App):
                 "inlineView[filters][0][values][1]": "build",
                 "inlineView[filters][1][selectedValue]": "committer",
                 "inlineView[filters][1][findType]": "is",
-                "inlineView[filters][1][values][0]": github_username,
+                "inlineView[filters][1][values][0]": settings.github_username,
                 "inlineView[type]": "build",
                 "inlineView[timeFrameStart][0]": self.menu[Menus.time_period()].selected_time_period,
                 "limit": 99999999,
             },
         )
-        print("got cf builds")
+        log.info("got cf builds")
         response.raise_for_status()
         body = response.json()
         self.last_errored_builds = self._builds_with_errors(body)
         if self.last_errored_builds:
             # TODO: need to track build IDs we've notified about so we dont spam notifications every 10s
-            rumps.notification(title="title", subtitle="subtitle", message="message", sound=True)
+            rumps.notification(
+                title=f"{len(self.last_errored_builds)} failed {p.plural('build', len(self.last_errored_builds))}",
+                subtitle=", ".join(set([b["repoName"] for b in self.last_errored_builds])),
+                message=None,
+                sound=True,
+            )
         self._update_errored_builds_menu()
 
     def _builds_with_errors(self, body) -> bool:
         builds = body["workflows"]["docs"]
+        log.info(f"retrieved {len(builds)} total builds")
         all_errored_builds = [b for b in builds if b["status"] == "error" and b["id"]]
-        print(f"found {len(all_errored_builds)} builds with errors")
+        log.info(f"found {len(all_errored_builds)} builds with errors")
         filtered_errored_builds = [
             b for b in all_errored_builds if not ignore_build_ids.contains(tinydb.where("build_id") == b["id"])
         ]
-        print(f"filtered {len(all_errored_builds) - len(filtered_errored_builds)} builds with errors")
+        log.info(f"filtered {len(all_errored_builds) - len(filtered_errored_builds)} builds with errors")
         return filtered_errored_builds
 
     def _update_errored_builds_menu(self):
-        print("building errored builds menu")
+        log.info("building errored builds menu")
         errored_builds_menu = self.menu[Menus.errored_builds()]
         len(errored_builds_menu) and errored_builds_menu.clear()
         if not self.last_errored_builds:
