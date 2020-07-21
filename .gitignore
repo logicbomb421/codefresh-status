@@ -1,6 +1,7 @@
 
 db.json
 .vscode/
+.DS_Store
 
 ##############################################################################
 # Copied from https://github.com/github/gitignore/blob/master/Python.gitignore

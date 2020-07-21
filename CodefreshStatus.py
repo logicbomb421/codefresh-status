@@ -12,6 +12,7 @@ p = inflect.engine()
 db = tinydb.TinyDB(db_file)
 
 ignore_build_ids = db.table("ignore_build_ids")
+notified_build_ids = db.table("notified_build_ids")
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s [%(levelname)s]: %(message)s")
 log = logging.getLogger("cfstatus")
@@ -30,19 +31,27 @@ class Settings(tinydb.table.Table):
     def status_check_interval(self) -> str:
         return self.find_by_key("status_check_interval")
 
+    @property
+    def notifications_enabled(self) -> bool:
+        return self.find_by_key("notifications_enabled")
+
+    @property
+    def show_build_on_restart(self) -> bool:
+        return self.find_by_key("show_build_on_restart")
+
     def __init__(self):
         super().__init__(db.storage, "settings")
 
     def find_by_key(self, key: str):
         all_settings = self.all()
-        return next(iter([s for s in all_settings if s.get(key)]), {}).get(key, None)
+        return next(iter([s for s in all_settings if not s.get(key) is None]), {}).get(key, None)
 
     def set_default_value(self, key, value, overwrite=False):
         exists = self.find_by_key(key)
-        if exists and not overwrite:
+        if exists is not None and not overwrite:
             return
         mapping = {key: value}
-        self.update(mapping) if exists else self.insert(mapping)
+        self.upsert(mapping, None)
 
 
 settings = Settings()
@@ -63,6 +72,8 @@ class SettingsChoices(CallableEnum):
     codefresh_api_key = "Codefresh API Key"
     github_username = "Github Username"
     status_check_interval = "Status Check Interval"
+    notifications = "Notifications"
+    show_build_on_restart = "Show Build on Restart"
 
 
 class ErroredBuildsMenuChoices(CallableEnum):
@@ -123,17 +134,19 @@ class ErroredBuildsMenuItem(rumps.MenuItem):
         self.build = build
         self.app = app
         self[ErroredBuildsMenuChoices.view()] = rumps.MenuItem(
-            ErroredBuildsMenuChoices.view(), callback=self._view_build
+            ErroredBuildsMenuChoices.view(), callback=lambda sender: self._view_build(self.build["id"])
         )
         # TODO:(idea): if we restart a build, it would be cool to check if it succeeded
         # when we look for builds, and if so, auto-mark it fixed.
-        self[ErroredBuildsMenuChoices.restart()] = rumps.MenuItem(ErroredBuildsMenuChoices.restart())  # TODO: handler
+        self[ErroredBuildsMenuChoices.restart()] = rumps.MenuItem(
+            ErroredBuildsMenuChoices.restart(), callback=self._restart_failed_build
+        )
         self[ErroredBuildsMenuChoices.mark_fixed()] = rumps.MenuItem(
             ErroredBuildsMenuChoices.mark_fixed(), callback=self._mark_fixed
         )
 
-    def _view_build(self, sender):
-        webbrowser.open("https://g.codefresh.io/build/%(id)s" % self.build)
+    def _view_build(self, build_id):
+        webbrowser.open(f"https://g.codefresh.io/build/{build_id}")
 
     def _mark_fixed(self, sender):
         log.info("ignoring build with id " + self.build["id"])
@@ -142,11 +155,40 @@ class ErroredBuildsMenuItem(rumps.MenuItem):
         self.app.last_errored_builds.remove(self.build)
         self.app._update_errored_builds_menu()
 
+    def _restart_failed_build(self, sender):
+        log.info("restarting build with ID: " + self.build["id"])
+        response = requests.get(
+            f"https://g.codefresh.io/api/builds/rebuild/{self.build['id']}",
+            headers={"Authorization": settings.codefresh_api_key},
+        )
+        response.raise_for_status()
+        new_build_id = response.json()
+        log.info("created build " + new_build_id)
+        if not settings.show_build_on_restart:
+            log.info("show_build_on_restart disabled")
+            return
+        self._view_build(new_build_id)
+
 
 class SettingsMenu(rumps.MenuItem):
     def __init__(self, app):
         super().__init__(Menus.settings())
         self.app = app
+        self._set_defaults()
+        self[SettingsChoices.notifications()] = rumps.MenuItem(
+            SettingsChoices.notifications(), callback=self._toggle_setting("notifications_enabled")
+        )
+        self[SettingsChoices.show_build_on_restart()] = rumps.MenuItem(
+            SettingsChoices.show_build_on_restart(), callback=self._toggle_setting("show_build_on_restart")
+        )
+        # TODO: need to clean up this default state setting
+        self[SettingsChoices.notifications()].state = (
+            MenuState.on() if settings.notifications_enabled else MenuState.off()
+        )
+        self[SettingsChoices.show_build_on_restart()].state = (
+            MenuState.on() if settings.show_build_on_restart else MenuState.off()
+        )
+        self[rumps.separator] = rumps.separator
         self[SettingsChoices.codefresh_api_key()] = rumps.MenuItem(
             SettingsChoices.codefresh_api_key(),
             callback=self._gather_user_input("The Codefresh API key to authenticate with.", "codefresh_api_key",),
@@ -165,15 +207,30 @@ class SettingsMenu(rumps.MenuItem):
                 "The number of seconds between checking Codefresh builds.", "status_check_interval", _set_interval,
             ),
         )
-        self._set_defaults()
 
     def _set_defaults(self):
         settings.set_default_value("status_check_interval", 10)
+        settings.set_default_value("notifications_enabled", True)
+        settings.set_default_value("show_build_on_restart", True)
+
+    def _toggle_setting(self, db_key: str):
+        def _toggle(sender):
+            # TODO: could use some type checking around this eventually
+            val = not settings.find_by_key(db_key)
+            log.info(f"toggling settings[{db_key}] to {val}")
+            settings.update({db_key: val})
+            sender.state = MenuState.on() if val else MenuState.off()
+
+        return _toggle
 
     def _gather_user_input(self, message, db_key, on_update=None):
         def _gather(sender):
             response = rumps.Window(
-                title=sender.title, message=message, default_text=settings.find_by_key(db_key) or "", cancel=True,
+                title=sender.title,
+                message=message,
+                default_text=settings.find_by_key(db_key) or "",
+                cancel=True,
+                dimensions=(320, 60),
             ).run()
             if not response.clicked:
                 return
@@ -233,15 +290,32 @@ class CodefreshStatusApp(rumps.App):
         response.raise_for_status()
         body = response.json()
         self.last_errored_builds = self._builds_with_errors(body)
-        if self.last_errored_builds:
-            # TODO: need to track build IDs we've notified about so we dont spam notifications every 10s
-            rumps.notification(
-                title=f"{len(self.last_errored_builds)} failed {p.plural('build', len(self.last_errored_builds))}",
-                subtitle=", ".join(set([b["repoName"] for b in self.last_errored_builds])),
-                message=None,
-                sound=True,
-            )
+        self._notify_failed_builds()
         self._update_errored_builds_menu()
+
+    def _notify_failed_builds(self):
+        log.info("processing notifications")
+        # TODO: togglable notifiactions setting
+        if not settings.notifications_enabled:
+            log.info("notifications currently disabled")
+            return
+        if not self.last_errored_builds:
+            return
+        unseen_failed_builds = [
+            b for b in self.last_errored_builds if not notified_build_ids.search(tinydb.where("build_id") == b["id"])
+        ]
+        if not unseen_failed_builds:
+            log.info("no unseen failed builds to notify on")
+            return
+        log.info(f"{len(unseen_failed_builds)} unseen failed build(s), triggering notification")
+        rumps.notification(
+            title=f"{len(unseen_failed_builds)} failed {p.plural('build', len(unseen_failed_builds))} since last check",
+            subtitle=", ".join(set([b["repoName"] for b in unseen_failed_builds])),
+            message=None,
+            sound=True,
+        )
+        ids = [{"build_id": b["id"]} for b in unseen_failed_builds]
+        notified_build_ids.insert_multiple(ids)
 
     def _builds_with_errors(self, body) -> bool:
         builds = body["workflows"]["docs"]
@@ -272,7 +346,7 @@ class CodefreshStatusApp(rumps.App):
             ago = f"{time_since_build.hours} {p.plural('hour', time_since_build.hours)}, {time_since_build.minutes} {p.plural('minute', time_since_build.minutes)} ago"
             if time_since_build.days:
                 ago = f"{time_since_build.days} {p.plural('day', time_since_build.days)}, {ago}"
-                build_id = b["id"]
+            build_id = b["id"]
             errored_builds_menu[build_id] = ErroredBuildsMenuItem(build_id, b, self)
             errored_builds_menu[build_id].title = f"{b['repoName']} - {b['branchName']} - {ago}"
 

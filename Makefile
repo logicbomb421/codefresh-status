@@ -17,3 +17,4 @@ assets:
 	cp ./dist/CodefreshStatus.app/Contents/Resources/*.png ./dist/CodefreshStatus.app/Contents/Resources/assets
 
 release: build assets
+	zip -r ./dist/CodefreshStatus.app.zip ./dist/CodefreshStatus.app/
